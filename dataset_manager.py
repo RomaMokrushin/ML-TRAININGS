@@ -1,5 +1,5 @@
 import pandas as pd
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, KFold
 
 
 class DatasetManager:
@@ -33,10 +33,17 @@ class TrainDatasetManager(DatasetManager):
         self.valid_df = None
         self.train_labels = None
         self.valid_labels = None
+        self.cross_valid_folds = []
 
     def train_valid_split(self, target_label):
         self.train_df, self.valid_df, self.train_labels, self.valid_labels = train_test_split(
-            self.df.drop([target_label], axis=1), self.df[target_label], test_size=0.2, random_state=666437)
+            self.df.drop([target_label], axis=1), self.df[target_label], test_size=0.2, random_state=2443)
+
+    def prepare_folds(self, number_of_folds, target_label):
+        kf = KFold(n_splits=number_of_folds, shuffle=True, random_state=64774)
+        for train_index, valid_index in kf.split(self.get_df().drop([target_label], axis=1),
+                                                 self.get_df()[target_label]):
+            self.cross_valid_folds.append((train_index, valid_index))
 
 
 class TestDatasetManager(DatasetManager):
@@ -49,7 +56,7 @@ class TestDatasetManager(DatasetManager):
         self.df[prediction_name] = predictions
 
     def form_submit(self, save_to_file_name):
-        self.df.to_csv(save_to_file_name, index=False, encoding="utf-8")
+        self.df.to_csv(save_to_file_name, index=False, encoding="utf-8", mode="w")
 
     def get_df(self):
         return super().get_df().drop([self.id_name], axis=1)
