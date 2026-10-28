@@ -13,16 +13,15 @@ from sklearn.datasets import make_classification
 from sklearn.model_selection import train_test_split, KFold
 from sklearn.metrics import roc_auc_score, accuracy_score
 
-SEED = 67691488
+random_seeds = 324221
+SEED = 4534423
 FC = 5
-RANDOM_STATE = 2138
+RANDOM_STATE = 432117
 
 warnings.filterwarnings("ignore")
 pd.set_option("display.max_columns", None)
 
 random.seed(SEED)
-np.random.seed(SEED)
-os.environ["PYTHONHASHSEED"] = str(SEED)
 
 
 class DataManager:
@@ -43,23 +42,23 @@ class DataManager:
 
     def preprocess_df(self):
         for df in (self.train_df, self.test_df):
-            df["Sex"] = df["Sex"].map({"male": 1, "female": 0})
+            df["Sex"] = df["Sex"].map({"male": 0, "female": 1})
             df["Title"] = df["Name"].str.extract(r",\s*([^\.]+)\.", expand=False).str.strip()
             df["Title"] = df["Title"].replace({"Mlle": "Miss", "Ms": "Miss", "Mme": "Mrs"})
             common = ["Mr", "Mrs", "Miss", "Master"]
             df["Title"] = df["Title"].where(df["Title"].isin(common), "Rare")
             df["Title"] = df["Title"].map({"Mr": 0, "Mrs": 1, "Miss": 2, "Master": 3, "Rare": 4})
-            df["FamilySize"] = df["SibSp"] + df["Parch"] + 1
-            df["IsAlone"] = (df["FamilySize"] == 1).astype(int)
-            df["Embarked"] = df["Embarked"].map({"S": 0, "C": 1, "Q": 2})
+            df["FamilyGroup"] = pd.cut(
+                df["SibSp"] + df["Parch"] + 1,
+                bins=[0, 1, 4, float("inf")],
+                labels=[0, 1, 2]
+            ).astype(int)
 
         age_med = self.train_df.groupby("Title")["Age"].median()
-        fare_med = self.train_df["Fare"].median()
         for df in (self.train_df, self.test_df):
             df["Age"] = df["Age"].fillna(df["Title"].map(age_med))
-            df["Fare"] = df["Fare"].fillna(fare_med)
 
-        drop_cols = ["Name", "Ticket", "Cabin", "SibSp", "Parch"]
+        drop_cols = ["Name", "Ticket", "Cabin", "SibSp", "Parch", "Fare", "Embarked"]
         self.train_df.drop(columns=drop_cols, inplace=True)
         self.test_df.drop(columns=drop_cols, inplace=True)
 
@@ -76,8 +75,6 @@ class DataManager:
 
     @staticmethod
     def downcast_df(df: pd.DataFrame) -> pd.DataFrame:
-        start = df.memory_usage().sum() / 1024 ** 2
-
         int_cols = df.select_dtypes(include=["integer"]).columns
         for col in int_cols:
             df[col] = pd.to_numeric(df[col], downcast="integer")
@@ -85,13 +82,6 @@ class DataManager:
         float_cols = df.select_dtypes(include=["floating"]).columns
         for col in float_cols:
             df[col] = pd.to_numeric(df[col], downcast="float")
-
-        end = df.memory_usage().sum() / 1024 ** 2
-
-        print('memory usage before optimization is: {:.2f} MB'.format(start))
-        print('memory usage after optimization is: {:.2f} MB'.format(end))
-        print('decreased by {:.1f}%'.format(100 * (start - end) / start))
-        print()
 
         return df
 
@@ -114,7 +104,7 @@ class LearningManager:
         train, valid = train_test_split(fr,
                                         train_size=.80,
                                         test_size=.20,
-                                        random_state=1723)
+                                        random_state=RANDOM_STATE)
         train.reset_index(drop=True,
                           inplace=True)
         valid.reset_index(drop=True,
@@ -133,13 +123,8 @@ class LearningManager:
             model, metrics = LearningManager.training_phase(train, valid, n, c, "av")
 
             if metrics > .63:
-
                 ind = np.argmax(model.feature_importance("gain"))
                 feats_space = n + c
-
-                print(feats_space[ind],
-                      metrics, "!!!!!!!!!!!!!!!!!!!!!")
-
                 cs[feats_space[ind]] = metrics
 
             else:
@@ -163,7 +148,7 @@ class LearningManager:
                                        inplace=True)
 
     @staticmethod
-    def training_phase(train, valid, nums, cats, target):
+    def training_phase(train, valid, nums, cats, target, seed=23143, rounds=150):
         train_dataset = lgb.Dataset(train[nums + cats],
                                     train[target],
                                     categorical_feature=cats)
@@ -173,77 +158,88 @@ class LearningManager:
 
         params = {
             "objective": "binary",
-            "metric": "binary_logloss",
-            "learning_rate": 0.03,
-            "num_boost_round": 2000,
-            "early_stopping_round": 100,
+            "learning_rate": 0.01,
+            "num_leaves": 7,  # или 6–8
             "max_depth": 4,
-            "num_leaves": 8,
-            "min_data_in_leaf": 15,
-            "lambda_l2": 5,
-            "bagging_fraction": 0.8,
-            "bagging_freq": 1,
+            "min_data_in_leaf": 25,
+            "lambda_l2": 10,
             "feature_fraction": 0.8,
-            "num_threads": 4,
-            "seed": 1723,
+            "bagging_fraction": 0.9,
+            "bagging_freq": 1,
             "verbose": -1,
+            "seed": seed
         }
 
         model = lgb.train(params=params,
                           train_set=train_dataset,
-                          valid_sets=[valid_dataset])
+                          valid_sets=[valid_dataset], num_boost_round=rounds)
 
         esti = model.predict(valid[nums + cats])
         ms = roc_auc_score(valid[target],
                            esti)
-        print(accuracy_score(valid[target], (esti > 0.5).astype(int)), " acc")
-        print(f"best_iter={model.best_iteration}, acc={accuracy_score(valid[target], (esti > .5).astype(int)):.4f}, "
-              f"pred_pos={(esti > .5).mean():.3f}, true_pos={valid[target].mean():.3f}")
 
         return model, ms
 
 
 def main():
-    lm: LearningManager = LearningManager()
+    global SEED, RANDOM_STATE
 
-    test_pred = np.zeros(len(lm.data_manager.test_df))
-    feats = lm.data_manager.nums + lm.data_manager.cats
+    base = LearningManager()
+    random_SEED = [random.randint(1, 100000) for _ in range(10)]
+    random_RANDOM_STATE = [random.randint(1, 100000) for _ in range(10)]
+    res_pred = np.zeros(len(base.data_manager.test_df))
 
-    metrics = []
+    for i in range(10):
+        lm: LearningManager = LearningManager()
 
-    for fold in tqdm(range(FC)):
+        test_pred = np.zeros(len(lm.data_manager.test_df))
+        feats = lm.data_manager.nums + lm.data_manager.cats
 
-        train = lm.data_manager.train_df.iloc[lm.data_manager.inds[fold][0]]
-        train.reset_index(drop=True,
-                          inplace=True)
+        metrics = []
 
-        valid = lm.data_manager.train_df.iloc[lm.data_manager.inds[fold][1]]
-        valid.reset_index(drop=True,
-                          inplace=True)
+        for fold in tqdm(range(FC)):
 
-        model, ms = lm.training_phase(train, valid,
-                                      lm.data_manager.nums, lm.data_manager.cats,
-                                      lm.data_manager.target)
+            train = lm.data_manager.train_df.iloc[lm.data_manager.inds[fold][0]]
+            train.reset_index(drop=True,
+                              inplace=True)
 
-        test_pred += model.predict(lm.data_manager.test_df[feats])
+            valid = lm.data_manager.train_df.iloc[lm.data_manager.inds[fold][1]]
+            valid.reset_index(drop=True,
+                              inplace=True)
 
-        metrics.append(ms)
+            model, ms = lm.training_phase(train, valid,
+                                          lm.data_manager.nums, lm.data_manager.cats,
+                                          lm.data_manager.target, seed=SEED)
 
-    test_pred /= FC
-    print([np.round(ms, 6) for ms in metrics], np.mean(metrics))
+            test_pred += model.predict(lm.data_manager.test_df[feats])
+
+            metrics.append(ms)
+
+        test_pred /= FC
+        print([np.round(ms, 6) for ms in metrics], np.mean(metrics))
+        print()
+
+        res_pred += test_pred
+
+        SEED = random_SEED[i]
+        RANDOM_STATE = random_RANDOM_STATE[i]
+
+        np.random.seed(SEED)
+        os.environ["PYTHONHASHSEED"] = str(SEED)
+
+        #print(submission.head())
+
+        # print("train\n", train_df_down.head())
+        # print("test\n", test_df_down.head())
+
+    res_pred /= 10
 
     submission = pd.DataFrame({
-        "PassengerId": lm.data_manager.test_df["PassengerId"],
-        "Survived": (test_pred > 0.5).astype(int),
+        "PassengerId": base.data_manager.test_df["PassengerId"],
+        "Survived": (res_pred > 0.5).astype(int),
     })
     submission.to_csv('data/gender_submission.csv',
                       index=False)
-    print("доля выживших в test:", (test_pred > .5).mean())  # ожидаемо около 0.35-0.40
-
-    #print(submission.head())
-
-    # print("train\n", train_df_down.head())
-    # print("test\n", test_df_down.head())
 
 
 if __name__ == "__main__":
