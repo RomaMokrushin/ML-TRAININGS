@@ -1,104 +1,100 @@
-import lightgbm as lgb
-import numpy as np
 import pandas as pd
-from sklearn.metrics import roc_auc_score
 
+import models
 import dataset_manager as dm
-import model_utils as utils
+import numpy as np
+from sklearn.metrics import roc_auc_score, accuracy_score, log_loss
+
+ENSEMBLE_MODELS_NUMBER = 5
+TARGET_LABEL = "Survived"
+ID_NAME = "PassengerId"
+WORK_COLUMNS = [TARGET_LABEL, "Pclass", "Sex", "Age",
+                "Fare", "Name", "Ticket"]
 
 
-class LGDManager:
-    def __init__(self, train_manager, test_manager):
-        self.train_valid_man = train_manager
-        self.test_man = test_manager
-        self.train_valid_man.drop_columns(
-            ["PassengerId", "Name", "Parch", "Ticket", "Cabin", "Embarked"]
-        )
-        self.test_man.drop_columns(
-            ["Name", "Parch", "Ticket", "Cabin", "Embarked"]
-        )
-        self.train_valid_man.train_valid_split("Survived")
+class TitanicFeatureEngineering:
+    def __init__(self, df_manager):
+        self.manager: dm.DatasetsControl = df_manager
+        self.cooking()
 
-        self.train_lgb = utils.df_to_lbm(self.train_valid_man.train_df,
-                                         self.train_valid_man.train_labels)
-        self.valid_lgb = utils.df_to_lbm(self.train_valid_man.valid_df,
-                                         self.train_valid_man.valid_labels)
+    def cooking(self):
+        m = self.manager
+        m.one_cat("Sex")
+        # m.one_cat("Embarked")
+        # m.elements_callback("Cabin", [self.get_floor])
+        # m.one_cat("Cabin")
 
+        m.elements_callback("Name", [self.get_surname], "Family")
+        self.get_family_members()
+        self.get_fare_per_person()
+        m.elements_callback("Name", [self.get_rank])
+        m.one_cat("Name")
 
-params = {
-    "objective": "binary",
-    "boosting_type": "gbdt",
-    "num_iterations": 40,
-    "learning_rate": 0.02,
-    "num_leaves": 12,
-    "num_threads": 1,
-    "verbose": -1
-}
+        m.train_manager.downcast_for_df()
+        m.test_manager.downcast_for_df()
 
+    def get_family_members(self):
+        m = self.manager
+        tr_df = m.train_manager.df["Family"]
+        ts_df = m.test_manager.df["Family"]
+        df = pd.concat([tr_df, ts_df]).value_counts()
+        m.train_manager.df["Family"] = tr_df.map(df)
+        m.test_manager.df["Family"] = ts_df.map(df)
 
-class EnsembleClassifier:
-    def __init__(self, number_of_models, target_name):
-        self.number_of_models = number_of_models
-        self.models = []
-        self.target_name = target_name
+    def get_fare_per_person(self):
+        m = self.manager
+        tr_ticket = m.train_manager.df["Ticket"]
+        ts_ticket = m.test_manager.df["Ticket"]
+        counts = pd.concat([tr_ticket, ts_ticket]).value_counts()
 
-    def _train_model(self, train_fold, valid_fold):
-        model_to_fit = lgb.train(
-            params=params,
-            train_set=train_fold,
-            valid_sets=[valid_fold],
-        )
-        self.models.append(model_to_fit)
+        m.train_manager.df["TicketFreq"] = tr_ticket.map(counts).astype("int16")
+        m.test_manager.df["TicketFreq"] = ts_ticket.map(counts).astype("int16")
 
-    def _unpack_fold(self, train_id, valid_id, train_df):
-        train = utils.df_to_lbm(
-            train_df.drop([self.target_name], axis=1).iloc[train_id],
-            train_df[self.target_name].iloc[train_id]
-        )
+        m.train_manager.df["FarePerPerson"] = m.train_manager.df["Fare"] / m.train_manager.df["TicketFreq"]
+        m.test_manager.df["FarePerPerson"] = m.test_manager.df["Fare"] / m.test_manager.df["TicketFreq"]
 
-        valid = utils.df_to_lbm(
-            train_df.drop([self.target_name], axis=1).iloc[valid_id],
-            train_df[self.target_name].iloc[valid_id]
-        )
-        return train, valid
+        m.train_manager.drop_columns(["Ticket"])
+        m.test_manager.drop_columns(["Ticket"])
+        m.train_manager.drop_columns(["TicketFreq"])
+        m.test_manager.drop_columns(["TicketFreq"])
 
-    def _unpack_dataframe_valid(self, valid_id, train_df):
-        return (train_df.drop([self.target_name], axis=1).iloc[valid_id],
-                train_df[self.target_name].iloc[valid_id])
+    @staticmethod
+    def get_rank(name: str):
+        t = name.split(',')[1].split('.')[0].strip()
+        t = {"Mlle": "Miss", "Ms": "Miss", "Mme": "Mrs"}.get(t, t)
+        return t if t in ("Mr", "Mrs", "Miss", "Master") else "U"
 
-    def train_ensemble(self, train_man):
-        roc_auc_per_model = []
-        for number in range(self.number_of_models):
-            fold = self._unpack_fold(*train_man.cross_valid_folds[number], train_man.get_df())
-            self._train_model(*fold)
-            valid_df_x, valid_df_y = self._unpack_dataframe_valid(train_man.cross_valid_folds[number][1],
-                                                                  train_man.get_df())
-            esti = self.models[number].predict(valid_df_x)
-            roc_auc_per_model.append(roc_auc_score(valid_df_y, esti))
-        return roc_auc_per_model
+    @staticmethod
+    def get_surname(name: str):
+        t = name.split(',')[0].strip()
+        return t
 
-    def predict(self, df):
-        predictions = pd.DataFrame({"0": np.zeros(len(df))})
-        for model in self.models:
-            predictions["0"] += model.predict(df)
-        predictions["0"] /= self.number_of_models
-        return predictions["0"].to_list()
-
-    def roc_auc_score_calc(self, target_col, validation_df):
-        return roc_auc_score(target_col, self.predict(validation_df))
+    @staticmethod
+    def get_floor(cabin: str):
+        return cabin[0] if isinstance(cabin, str) else "U"
 
 
 if __name__ == "__main__":
+    # init
     train_manager = dm.TrainDatasetManager("train.csv")
-    test_manager = dm.TestDatasetManager("test.csv", "PassengerId")
-    l_manager = LGDManager(train_manager, test_manager)
-
-    model = EnsembleClassifier(number_of_models=5, target_name="Survived")
-    train_manager.prepare_folds(number_of_folds=5, target_label="Survived")
-    print(model.train_ensemble(train_man=train_manager))
+    test_manager = dm.TestDatasetManager("test.csv", ID_NAME)
+    datasets_control = dm.DatasetsControl(
+        train_manager=train_manager,
+        test_manager=test_manager,
+        target_label=TARGET_LABEL
+    )
+    # prepare_for_dss
+    datasets_control.clean_dss(WORK_COLUMNS)
+    train_manager.prepare_folds(ENSEMBLE_MODELS_NUMBER, TARGET_LABEL)
+    TitanicFeatureEngineering(datasets_control)
+    # model init
+    model = models.EnsembleBinaryClassifier(
+        target_name=TARGET_LABEL
+    )
+    model.train_ensemble(train_manager)
+    # test predict
     test_manager.update_predictions(
-        prediction_name="Survived",
-        predictions=utils.binary_postprocess(model.predict(test_manager.get_df())),
+        target_label=TARGET_LABEL,
+        predictions=model.binary_postprocess(model.predict(test_manager.get_df()))
     )
     test_manager.form_submit("submit.csv")
-
